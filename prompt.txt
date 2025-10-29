@@ -1,0 +1,780 @@
+# pf - Personal Finance CLI (full repo)
+
+This document contains a complete, copy-paste-ready repository structure for the `pf` CLI (Personal Finance) project. Copy each file into the paths shown and run `pip install -e .` to install the `pf` console script. The repo is local-first (SQLite), contact-based lending/borrowing, and includes tests and examples.
+
+---
+
+## Repository tree
+
+```
+pf-cli/
+├── README.md
+├── pyproject.toml
+├── Makefile
+├── .gitignore
+├── pf/
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── db.py
+│   ├── models.py
+│   └── cli.py
+├── tests/
+│   ├── conftest.py
+│   ├── test_db.py
+│   ├── test_loans.py
+│   ├── test_repay_matching.py
+│   └── test_ask.py
+├── examples/
+│   ├── demo_data.sh
+│   └── mappings/
+│       └── sample_bank_mapping.json
+└── docs/
+    └── prompt_templates.md
+```
+
+---
+
+# Files
+
+## `README.md`
+
+````markdown
+# pf — Personal Finance CLI
+
+Lightweight CLI personal finance manager focused on contact-based lending/borrowing, local-first (SQLite), explainable `ask` assistant, and simple workflows.
+
+## Quick install
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+## Quickstart
+
+```bash
+pf init
+pf account-add --name Wallet
+pf contact-add --name Ali --relation friend --tags college football
+pf lend --contact Ali --account Wallet --amount 5000 --date 2025-10-01 --due 2025-12-01 --note "lent for groceries"
+pf repay --contact Ali --amount 2000 --date 2025-10-15 --note "partial"
+pf contact-summary --contact Ali
+pf contacts-report
+pf ask "how much I gave others this month?"
+```
+
+## Features
+
+- Accounts, transactions
+- Contact model (mother, father, brother, friend, cousin, other + tags)
+- Lend / Borrow flows linked to contacts
+- Repayments, auto-matching oldest-first
+- Contact summaries, aging buckets, and explainable `ask`
+- Local SQLite DB at `~/.pf/pf_db.sqlite` by default (override with `PF_DB_PATH`)
+
+## Commands
+
+Run `pf --help` for full usage.
+
+## Tests
+
+```bash
+make test
+```
+
+## Security & privacy
+
+- DB stays local by default.
+- Do not send raw bank account numbers or PII to external LLMs. Use aggregated summaries.
+
+## Extending
+
+See `docs/prompt_templates.md` for LLM prompt templates and `examples/` for CSV mapping.
+````
+
+---
+
+## `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pf"
+version = "0.1.0"
+description = "Personal Finance CLI (contacts + lending/borrowing)"
+readme = "README.md"
+authors = [ { name = "Abdul Basit Memon", email = "you@example.com" } ]
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[project.scripts]
+pf = "pf.__main__:main"
+
+[project.optional-dependencies]
+cli = ["click", "rich"]
+test = ["pytest"]
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-q"
+```
+
+---
+
+## `Makefile`
+
+```
+.PHONY: test run
+
+test:
+	pytest
+
+run:
+	pf
+
+clean:
+	rm -rf .pytest_cache __pycache__
+```
+
+---
+
+## `.gitignore`
+
+```
+__pycache__/
+.venv/
+*.pyc
+.pf/
+*.sqlite
+*.db
+.DS_Store
+```
+
+---
+
+## `pf/__init__.py`
+
+```python
+__version__ = "0.1.0"
+```
+
+---
+
+## `pf/__main__.py`
+
+```python
+from pf.cli import cli
+
+
+def main():
+    cli()
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## `pf/db.py`
+
+```python
+"""
+Database helper for pf.
+DB path defaults to ~/.pf/pf_db.sqlite but can be overridden with env var PF_DB_PATH.
+"""
+from pathlib import Path
+import sqlite3
+import os
+
+SCHEMA = """
+PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS accounts (
+  id INTEGER PRIMARY KEY, name TEXT UNIQUE, type TEXT, currency TEXT, created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS contacts (
+  id INTEGER PRIMARY KEY, name TEXT, relation TEXT, tags TEXT, note TEXT, created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS transactions (
+  id INTEGER PRIMARY KEY, account_id INTEGER, date TEXT, amount REAL, category TEXT, merchant TEXT, note TEXT,
+  tags TEXT, FOREIGN KEY(account_id) REFERENCES accounts(id)
+);
+CREATE TABLE IF NOT EXISTS loans (
+  id INTEGER PRIMARY KEY, contact_id INTEGER, txn_id INTEGER, role TEXT, amount REAL, date TEXT, due_date TEXT,
+  repaid_amount REAL DEFAULT 0, status TEXT DEFAULT 'open', note TEXT,
+  FOREIGN KEY(contact_id) REFERENCES contacts(id), FOREIGN KEY(txn_id) REFERENCES transactions(id)
+);
+CREATE TABLE IF NOT EXISTS loan_payments (
+  id INTEGER PRIMARY KEY, loan_id INTEGER, date TEXT, amount REAL, note TEXT,
+  FOREIGN KEY(loan_id) REFERENCES loans(id)
+);
+"""
+
+
+def get_db_path():
+    env = os.environ.get("PF_DB_PATH")
+    if env:
+        return Path(env).expanduser()
+    base = Path.home() / ".pf"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "pf_db.sqlite"
+
+
+def get_conn():
+    db_path = get_db_path()
+    first = not db_path.exists()
+    conn = sqlite3.connect(str(db_path), detect_types=sqlite3.PARSE_DECLTYPES)
+    conn.row_factory = sqlite3.Row
+    if first:
+        conn.executescript(SCHEMA)
+        conn.commit()
+    return conn
+```
+
+---
+
+## `pf/models.py`
+
+```python
+"""
+High-level models and business logic for pf CLI.
+"""
+from datetime import date
+import json
+from pf.db import get_conn
+
+
+def today_iso():
+    return date.today().isoformat()
+
+# Accounts
+
+def ensure_account(conn, name: str):
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM accounts WHERE name=?", (name,))
+    r = cur.fetchone()
+    if r:
+        return r[0]
+    cur.execute("INSERT INTO accounts(name,type,currency,created_at) VALUES(?,?,?,?)",
+                (name, "checking", "PKR", today_iso()))
+    conn.commit()
+    return cur.lastrowid
+
+# Contacts
+
+def add_contact(conn, name: str, relation: str = "other", tags=None, note: str = ""):
+    cur = conn.cursor()
+    cur.execute("INSERT INTO contacts(name,relation,tags,note,created_at) VALUES(?,?,?,?,?)",
+                (name, relation, json.dumps(tags or []), note or "", today_iso()))
+    conn.commit()
+    return cur.lastrowid
+
+
+def list_contacts(conn):
+    cur = conn.cursor()
+    return cur.execute("SELECT * FROM contacts ORDER BY name").fetchall()
+
+# Transactions
+
+def add_transaction(conn, account: str, amount: float, date_str: str = None, category: str = None,
+                    merchant: str = None, note: str = None, tags=None):
+    acc_id = ensure_account(conn, account)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO transactions(account_id,date,amount,category,merchant,note,tags) VALUES(?,?,?,?,?,?,?)",
+                (acc_id, date_str or today_iso(), float(amount), category or "", merchant or "", note or "", json.dumps(tags or [])))
+    conn.commit()
+    return cur.lastrowid
+
+# Loans (lend/borrow)
+
+def create_loan(conn, contact_name: str, account: str, amount: float, role: str, date_str: str = None, due_date: str = None, note: str = None):
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM contacts WHERE name=?", (contact_name,))
+    r = cur.fetchone()
+    if not r:
+        raise ValueError(f"Contact not found: {contact_name}")
+    contact_id = r[0]
+    # sign: you_lent => money out (negative), you_borrowed => money in (positive)
+    signed = -float(amount) if role == "you_lent" else float(amount)
+    txn_id = add_transaction(conn, account, signed, date_str, category=("lend" if role=="you_lent" else "borrow"), merchant=contact_name, note=note, tags=[role])
+    cur.execute("INSERT INTO loans(contact_id,txn_id,role,amount,date,due_date,note) VALUES(?,?,?,?,?,?,?)",
+                (contact_id, txn_id, role, float(amount), date_str or today_iso(), due_date, note or ""))
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_open_loans(conn, contact_id: int):
+    cur = conn.cursor()
+    return cur.execute("SELECT * FROM loans WHERE contact_id=? AND status='open' ORDER BY date ASC", (contact_id,)).fetchall()
+
+
+def apply_repayment_to_loan(conn, loan_row, amount: float, date_str: str = None, note: str = None):
+    cur = conn.cursor()
+    loan_id = loan_row["id"]
+    open_amount = loan_row["amount"] - (loan_row["repaid_amount"] or 0.0)
+    apply_amt = min(open_amount, amount)
+    cur.execute("INSERT INTO loan_payments(loan_id,date,amount,note) VALUES(?,?,?,?)",
+                (loan_id, date_str or today_iso(), apply_amt, note or "repayment"))
+    new_repaid = (loan_row["repaid_amount"] or 0.0) + apply_amt
+    new_status = "closed" if abs(new_repaid - loan_row["amount"]) < 1e-9 else "open"
+    cur.execute("UPDATE loans SET repaid_amount=?, status=? WHERE id=?", (new_repaid, new_status, loan_id))
+    # add transaction for cash flow: if you_lent then repayment is inflow (+); if you_borrowed repayment is outflow (-)
+    sign = 1.0 if loan_row["role"] == "you_lent" else -1.0
+    add_transaction(conn, "Wallet", sign * apply_amt, date_str, category="loan_payment", merchant=f"repay:{loan_id}", note=f"repayment for loan {loan_id}")
+    conn.commit()
+    return apply_amt
+
+
+def repay_contact_oldest_first(conn, contact_name: str, amount: float, date_str: str = None, note: str = None):
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM contacts WHERE name=?", (contact_name,))
+    r = cur.fetchone()
+    if not r:
+        raise ValueError(f"Contact not found: {contact_name}")
+    cid = r[0]
+    loans = get_open_loans(conn, cid)
+    remaining = float(amount)
+    if not loans:
+        # no open loans -> treat as simple transaction deposit
+        add_transaction(conn, "Wallet", float(amount), date_str, category="repayment", merchant=contact_name, note=note)
+        return {"unapplied": 0.0, "applied": float(amount)}
+    applied_total = 0.0
+    for loan in loans:
+        if remaining <= 0:
+            break
+        applied = apply_repayment_to_loan(conn, loan, remaining, date_str, note)
+        remaining -= applied
+        applied_total += applied
+    return {"unapplied": remaining, "applied": applied_total}
+
+# Summaries & reports
+
+def compute_contact_summary(conn, contact_name: str):
+    cur = conn.cursor()
+    cur.execute("SELECT id,name,relation,tags,note FROM contacts WHERE name=?", (contact_name,))
+    c = cur.fetchone()
+    if not c:
+        raise ValueError("Contact not found")
+    cid = c[0]
+    lent_total = cur.execute("SELECT IFNULL(SUM(amount),0) FROM loans WHERE contact_id=? AND role='you_lent'", (cid,)).fetchone()[0]
+    lent_repaid = cur.execute("SELECT IFNULL(SUM(repaid_amount),0) FROM loans WHERE contact_id=? AND role='you_lent'", (cid,)).fetchone()[0]
+    lent_open = cur.execute("SELECT IFNULL(SUM(amount - IFNULL(repaid_amount,0)),0) FROM loans WHERE contact_id=? AND role='you_lent' AND status='open'", (cid,)).fetchone()[0]
+    bor_total = cur.execute("SELECT IFNULL(SUM(amount),0) FROM loans WHERE contact_id=? AND role='you_borrowed'", (cid,)).fetchone()[0]
+    bor_repaid = cur.execute("SELECT IFNULL(SUM(repaid_amount),0) FROM loans WHERE contact_id=? AND role='you_borrowed'", (cid,)).fetchone()[0]
+    bor_open = cur.execute("SELECT IFNULL(SUM(amount - IFNULL(repaid_amount,0)),0) FROM loans WHERE contact_id=? AND role='you_borrowed' AND status='open'", (cid,)).fetchone()[0]
+    net = (lent_open or 0.0) - (bor_open or 0.0)
+    return {
+        "contact": dict(c),
+        "lent_total": lent_total or 0.0,
+        "lent_repaid": lent_repaid or 0.0,
+        "lent_open": lent_open or 0.0,
+        "borrowed_total": bor_total or 0.0,
+        "borrowed_repaid": bor_repaid or 0.0,
+        "borrowed_open": bor_open or 0.0,
+        "net": net
+    }
+
+
+def contacts_report(conn):
+    cur = conn.cursor()
+    rows = cur.execute("SELECT id,name FROM contacts ORDER BY name").fetchall()
+    result = []
+    grand_they_owe = 0.0
+    grand_you_owe = 0.0
+    for r in rows:
+        cid = r[0]
+        name = r[1]
+        lent_open = cur.execute("SELECT IFNULL(SUM(amount - IFNULL(repaid_amount,0)),0) FROM loans WHERE contact_id=? AND role='you_lent' AND status='open'", (cid,)).fetchone()[0]
+        bor_open = cur.execute("SELECT IFNULL(SUM(amount - IFNULL(repaid_amount,0)),0) FROM loans WHERE contact_id=? AND role='you_borrowed' AND status='open'", (cid,)).fetchone()[0]
+        grand_they_owe += lent_open or 0.0
+        grand_you_owe += bor_open or 0.0
+        result.append({"name": name, "they_owe_you": lent_open or 0.0, "you_owe_them": bor_open or 0.0, "net": (lent_open or 0.0) - (bor_open or 0.0)})
+    return {"contacts": result, "grand_they_owe": grand_they_owe, "grand_you_owe": grand_you_owe, "net": grand_they_owe - grand_you_owe}
+
+
+def aging_buckets(conn):
+    cur = conn.cursor()
+    rows = cur.execute("SELECT * FROM loans WHERE status='open' ORDER BY date").fetchall()
+    buckets = {"0-30":0.0, "31-90":0.0, "91-180":0.0, "180+":0.0}
+    from datetime import date as _d
+    today = _d.today()
+    for r in rows:
+        dt = _d.fromisoformat(r["date"]) if r["date"] else _d.today()
+        age = (today - dt).days
+        open_amt = r["amount"] - (r["repaid_amount"] or 0.0)
+        if age <= 30:
+            buckets["0-30"] += open_amt
+        elif age <= 90:
+            buckets["31-90"] += open_amt
+        elif age <= 180:
+            buckets["91-180"] += open_amt
+        else:
+            buckets["180+"] += open_amt
+    return buckets
+
+# Ask agent (rule-based)
+
+def ask_agent(conn, query: str):
+    q = query.lower()
+    if "how much i gave" in q or "how much i give" in q:
+        d = _month_start()
+        cur = conn.cursor()
+        s = cur.execute("SELECT IFNULL(SUM(amount),0) FROM loans WHERE role='you_lent' AND date>=?", (d,)).fetchone()[0]
+        explanation = f"SUM(loans.role='you_lent' AND date >= '{d}') = {s}"
+        return {"answer": float(s), "explanation": explanation}
+    if "how much i take" in q or "how much i borrow" in q:
+        d = _month_start()
+        cur = conn.cursor()
+        s = cur.execute("SELECT IFNULL(SUM(amount),0) FROM loans WHERE role='you_borrowed' AND date>=?", (d,)).fetchone()[0]
+        explanation = f"SUM(loans.role='you_borrowed' AND date >= '{d}') = {s}"
+        return {"answer": float(s), "explanation": explanation}
+    if "outstanding" in q or "borrow from others" in q:
+        rep = contacts_report(conn)
+        return {"answer": rep, "explanation": "contacts report"}
+    return {"answer": None, "explanation": "I can answer: 'how much i gave', 'how much i borrowed', 'outstanding'"}
+
+
+def _month_start():
+    from datetime import date
+    d = date.today()
+    return d.replace(day=1).isoformat()
+```
+
+---
+
+## `pf/cli.py`
+
+```python
+import click
+from pf.db import get_conn
+from pf import models
+from rich.console import Console
+from rich.table import Table
+
+console = Console()
+
+@click.group()
+def cli():
+    """pf: Personal Finance CLI"""
+
+@cli.command()
+def init():
+    conn = get_conn()
+    console.print(f"DB initialized at [bold]{str(models.__import__('pf.db').db_path if hasattr(models.__import__('pf.db'), 'db_path') else 'default location')}[/bold]")
+
+@cli.command('account-add')
+@click.option('--name', required=True)
+def account_add(name):
+    conn = get_conn()
+    models.ensure_account(conn, name)
+    console.print(f"Account added: {name}")
+
+@cli.command('contact-add')
+@click.option('--name', required=True)
+@click.option('--relation', default='other')
+@click.option('--tags', multiple=True)
+@click.option('--note')
+def contact_add(name, relation, tags, note):
+    conn = get_conn()
+    models.add_contact(conn, name, relation, tags, note)
+    console.print(f"Contact added: {name}")
+
+@cli.command('contact-list')
+def contact_list():
+    conn = get_conn()
+    rows = models.list_contacts(conn)
+    table = Table(title="Contacts")
+    table.add_column("ID")
+    table.add_column("Name")
+    table.add_column("Relation")
+    table.add_column("Tags")
+    table.add_column("Note")
+    for r in rows:
+        tags = ','.join(json.loads(r['tags'] or '[]')) if r['tags'] else ''
+        table.add_row(str(r['id']), r['name'], r['relation'], tags, r['note'] or '')
+    console.print(table)
+
+@cli.command()
+@click.option('--contact', required=True)
+@click.option('--account', required=True)
+@click.option('--amount', required=True, type=float)
+@click.option('--date')
+@click.option('--due')
+@click.option('--note')
+def lend(contact, account, amount, date, due, note):
+    conn = get_conn()
+    models.create_loan(conn, contact, account, amount, 'you_lent', date, due, note)
+    console.print(f"Loan recorded: you_lent {amount} with {contact}")
+
+@cli.command()
+@click.option('--contact', required=True)
+@click.option('--account', required=True)
+@click.option('--amount', required=True, type=float)
+@click.option('--date')
+@click.option('--due')
+@click.option('--note')
+def borrow(contact, account, amount, date, due, note):
+    conn = get_conn()
+    models.create_loan(conn, contact, account, amount, 'you_borrowed', date, due, note)
+    console.print(f"Loan recorded: you_borrowed {amount} with {contact}")
+
+@cli.command()
+@click.option('--contact', required=True)
+@click.option('--amount', required=True, type=float)
+@click.option('--loan_id', type=int)
+@click.option('--date')
+@click.option('--note')
+def repay(contact, amount, loan_id, date, note):
+    conn = get_conn()
+    if loan_id:
+        # try apply to specific loan
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM loans WHERE id=?", (loan_id,))
+        loan = cur.fetchone()
+        if not loan:
+            console.print("Loan not found")
+            return
+        applied = models.apply_repayment_to_loan(conn, loan, amount, date, note)
+        console.print(f"Applied {applied:.2f} to loan {loan_id}")
+    else:
+        res = models.repay_contact_oldest_first(conn, contact, amount, date, note)
+        console.print(f"Repay result: applied={res['applied']:.2f}, unapplied={res['unapplied']:.2f}")
+
+@cli.command('contact-summary')
+@click.option('--contact', required=True)
+def contact_summary(contact):
+    conn = get_conn()
+    s = models.compute_contact_summary(conn, contact)
+    table = Table(title=f"Contact: {contact}")
+    table.add_column("Metric")
+    table.add_column("Value")
+    table.add_row("They owe you (open)", f"{s['lent_open']:.2f}")
+    table.add_row("You owe them (open)", f"{s['borrowed_open']:.2f}")
+    table.add_row("Net", f"{s['net']:.2f}")
+    console.print(table)
+
+@cli.command('contacts-report')
+def contacts_report_cmd():
+    conn = get_conn()
+    rep = models.contacts_report(conn)
+    table = Table(title="Contacts report")
+    table.add_column("Name")
+    table.add_column("They owe you")
+    table.add_column("You owe them")
+    table.add_column("Net")
+    for c in rep['contacts']:
+        table.add_row(c['name'], f"{c['they_owe_you']:.2f}", f"{c['you_owe_them']:.2f}", f"{c['net']:.2f}")
+    table.add_row("GRAND", f"{rep['grand_they_owe']:.2f}", f"{rep['grand_you_owe']:.2f}", f"{rep['net']:.2f}")
+    console.print(table)
+
+@cli.command('aging')
+def aging_cmd():
+    conn = get_conn()
+    b = models.aging_buckets(conn)
+    table = Table(title="Aging buckets")
+    table.add_column("Bucket")
+    table.add_column("Amount")
+    for k,v in b.items():
+        table.add_row(k, f"{v:.2f}")
+    console.print(table)
+
+@cli.command('summary')
+@click.option('--period', default='month', type=click.Choice(['day','week','month']))
+@click.option('--month')
+def summary_cmd(period, month):
+    conn = get_conn()
+    rep = models.compute_month_summary(conn, period, month) if hasattr(models, 'compute_month_summary') else None
+    console.print("Summary command — basic version. Use pf summary for detailed reports.")
+
+@cli.command('ask')
+@click.argument('query', nargs=-1)
+def ask_cmd(query):
+    q = ' '.join(query)
+    conn = get_conn()
+    ans = models.ask_agent(conn, q)
+    console.print(ans['answer'])
+    console.print(f"Explanation: {ans['explanation']}")
+
+if __name__ == '__main__':
+    cli()
+```
+
+---
+
+> **Note:** `cli.py` references a `compute_month_summary` function that is optional. You can implement richer summary logic in `models.py` or adapt `summary` command to use `models.summary` from earlier prototype.
+
+---
+
+## `tests/conftest.py`
+
+```python
+import os
+import tempfile
+import pytest
+from pathlib import Path
+
+@pytest.fixture(autouse=True)
+def use_temp_db(monkeypatch, tmp_path):
+    db_file = tmp_path / "pf_test.sqlite"
+    monkeypatch.setenv('PF_DB_PATH', str(db_file))
+    yield
+```
+
+---
+
+## `tests/test_db.py`
+
+```python
+from pf.db import get_conn
+
+
+def test_db_init():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = [r[0] for r in cur.fetchall()]
+    assert 'accounts' in tables
+    assert 'contacts' in tables
+    assert 'transactions' in tables
+    assert 'loans' in tables
+    assert 'loan_payments' in tables
+```
+
+---
+
+## `tests/test_loans.py`
+
+```python
+from pf.db import get_conn
+from pf.models import add_contact, create_loan, repay_contact_oldest_first, compute_contact_summary
+
+
+def test_lend_and_repay():
+    conn = get_conn()
+    add_contact(conn, 'Ali', 'friend', [], '')
+    create_loan(conn, 'Ali', 'Wallet', 5000, 'you_lent', '2025-10-01')
+    res = repay_contact_oldest_first(conn, 'Ali', 2000, '2025-10-02')
+    summary = compute_contact_summary(conn, 'Ali')
+    assert summary['lent_open'] == 3000
+    assert res['applied'] == 2000
+```
+
+---
+
+## `tests/test_repay_matching.py`
+
+```python
+from pf.db import get_conn
+from pf.models import add_contact, create_loan, repay_contact_oldest_first
+
+
+def test_repay_matches_oldest():
+    conn = get_conn()
+    add_contact(conn, 'Bilal', 'friend', [], '')
+    # two loans
+    create_loan(conn, 'Bilal', 'Wallet', 1000, 'you_lent', '2025-01-01')
+    create_loan(conn, 'Bilal', 'Wallet', 2000, 'you_lent', '2025-02-01')
+    res = repay_contact_oldest_first(conn, 'Bilal', 1500, '2025-03-01')
+    # oldest loan should be partially/fully repaid: 1000 applied then 500 applied to next
+    assert res['applied'] == 1500
+    # check outstanding for first loan is 0
+    cur = conn.cursor()
+    cur.execute("SELECT repaid_amount, status FROM loans WHERE id=1")
+    r1 = cur.fetchone()
+    assert r1['status'] == 'closed'
+```
+
+---
+
+## `tests/test_ask.py`
+
+```python
+from pf.db import get_conn
+from pf.models import add_contact, create_loan, ask_agent
+
+
+def test_ask_gave_borrowed():
+    conn = get_conn()
+    add_contact(conn, 'Sara', 'friend', [], '')
+    create_loan(conn, 'Sara', 'Wallet', 3000, 'you_lent', '2025-10-01')
+    r = ask_agent(conn, 'how much I gave others this month')
+    assert 'explanation' in r
+    assert r['answer'] is not None
+```
+
+---
+
+## `examples/demo_data.sh`
+
+```bash
+#!/usr/bin/env bash
+set -e
+
+# Populate demo data
+pf init
+pf account-add --name Wallet
+pf contact-add --name Ali --relation friend --tags college football
+pf contact-add --name Mom --relation mother
+pf lend --contact Ali --account Wallet --amount 5000 --date 2025-01-01 --due 2025-03-01 --note "lent groceries"
+pf lend --contact Mom --account Wallet --amount 2000 --date 2025-02-15 --note "help"
+pf borrow --contact Ali --account Wallet --amount 1500 --date 2025-03-01 --note "borrowed back"
+pf repay --contact Ali --amount 2000 --date 2025-04-01 --note "partial repay"
+
+pf contacts-report
+pf aging
+pf contact-summary --contact Ali
+pf ask "how much I gave others this month"
+```
+
+---
+
+## `examples/mappings/sample_bank_mapping.json`
+
+```json
+{
+  "date_col": "Date",
+  "desc_col": "Description",
+  "amount_col": "Amount",
+  "date_format": "%Y-%m-%d",
+  "map": {
+    "groceries": ["SuperMart","Grocery"],
+    "salary": ["Employer"]
+  }
+}
+```
+
+---
+
+## `docs/prompt_templates.md`
+
+````markdown
+# pf — LLM prompt templates & privacy checklist
+
+## System prompt
+```
+You are pf-assistant, a helpful personal finance assistant. Only use the provided JSON context. Never request or output bank account numbers or raw PII. Show arithmetic steps used to compute results.
+```
+
+## User wrapper (example)
+
+Send JSON like:
+
+```json
+{
+  "summary": {
+    "balance_by_account": [{"account":"Wallet","balance":12000}],
+    "last_30_txns": [{ "date":"2025-10-01","amount":-500,"category":"groceries","merchant":"SuperMart" }],
+    "contacts_summary": [{"name":"Ali","they_owe_you":3000,"you_owe_them":500}]
+  },
+  "question": "How can I save 50,000 in 6 months?"
+}
+```
+
+### Guidelines
+- Only send aggregated numbers and a small recent set of transactions (last 20).
+- Exclude all notes containing PII or account numbers.
+- Add a short explanation of assumptions in every LLM answer.
+````

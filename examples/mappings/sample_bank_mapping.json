@@ -1,0 +1,10 @@
+{
+  "date_col": "Date",
+  "desc_col": "Description",
+  "amount_col": "Amount",
+  "date_format": "%Y-%m-%d",
+  "map": {
+    "groceries": ["SuperMart","Grocery"],
+    "salary": ["Employer"]
+  }
+}

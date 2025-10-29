@@ -1,0 +1,7 @@
+click
+rich
+
+[dev]
+pytest
+build
+twine

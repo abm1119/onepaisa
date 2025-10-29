@@ -1,0 +1,52 @@
+# onepaisa — Personal Finance CLI
+
+Lightweight CLI personal finance manager focused on contact-based lending/borrowing, local-first (SQLite), explainable `ask` assistant, and simple workflows.
+
+## Quick install
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+## Quickstart
+
+```bash
+onepaisa init
+onepaisa account-add --name Wallet
+onepaisa contact-add --name Ali --relation friend --tags college football
+onepaisa lend --contact Ali --account Wallet --amount 5000 --date 2025-10-01 --due 2025-12-01 --note "lent for groceries"
+onepaisa repay --contact Ali --amount 2000 --date 2025-10-15 --note "partial"
+onepaisa contact-summary --contact Ali
+onepaisa contacts-report
+onepaisa ask "how much I gave others this month?"
+```
+
+## Features
+
+- Accounts, transactions
+- Contact model (mother, father, brother, friend, cousin, other + tags)
+- Lend / Borrow flows linked to contacts
+- Repayments, auto-matching oldest-first
+- Contact summaries, aging buckets, and explainable `ask`
+- Local SQLite DB at `~/.onepaisa/onepaisa_db.sqlite` by default (override with `ONEPAISA_DB_PATH`)
+
+## Commands
+
+Run `onepaisa --help` for full usage.
+
+## Tests
+
+```bash
+make test
+```
+
+## Security & privacy
+
+- DB stays local by default.
+- Do not send raw bank account numbers or PII to external LLMs. Use aggregated summaries.
+
+## Extending
+
+See `docs/prompt_templates.md` for LLM prompt templates and `examples/` for CSV mapping.
